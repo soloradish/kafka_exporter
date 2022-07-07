@@ -872,7 +872,7 @@ func setup(
 	)
 
 	topicPartitionSize = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "topic", "partition_size"),
+		prometheus.BuildFQName(namespace, "topic", "partition_size_bytes"),
 		"Size for this Topic Partition",
 		[]string{"topic", "partition"}, labels,
 	)
