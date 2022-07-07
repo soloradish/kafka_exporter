@@ -73,6 +73,8 @@ type Exporter struct {
 	topicWorkers            int
 	allowConcurrent         bool
 	sgMutex                 sync.Mutex
+	sgPartitionsMutex       sync.Mutex
+	sgPartitionLeadersMutex sync.Mutex
 	sgWaitCh                chan struct{}
 	sgChans                 []chan<- prometheus.Metric
 	consumerGroupFetchAll   bool
@@ -295,7 +297,7 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- topicCurrentOffset
 	ch <- topicOldestOffset
 	ch <- topicPartitions
-        ch <- topicPartitionSize
+	ch <- topicPartitionSize
 	ch <- topicPartitionLeader
 	ch <- topicPartitionReplicas
 	ch <- topicPartitionInSyncReplicas
@@ -365,6 +367,8 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 	)
 
 	offset := make(map[string]map[int32]int64)
+	partitionLeaders := make(map[int32]map[string][]int32, len(e.client.Brokers()))
+	partitionSizes := make(map[string]map[int32]int64)
 
 	now := time.Now()
 
@@ -382,6 +386,10 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 	if err != nil {
 		glog.Errorf("Cannot get topics: %v", err)
 		return
+	}
+
+	for _, broker := range e.client.Brokers() {
+		partitionLeaders[broker.ID()] = make(map[string][]int32, len(topics))
 	}
 
 	topicChannel := make(chan string)
@@ -404,33 +412,20 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 
 		e.mu.Lock()
 		offset[topic] = make(map[int32]int64, len(partitions))
+		partitionSizes[topic] = make(map[int32]int64, len(partitions))
 		e.mu.Unlock()
 		for _, partition := range partitions {
 			broker, err := e.client.Leader(topic, partition)
 			if err != nil {
 				glog.Errorf("Cannot get leader of topic %s partition %d: %v", topic, partition, err)
 			} else {
+				e.sgPartitionLeadersMutex.Lock()
+				partitionLeaders[broker.ID()][topic] = append(partitionLeaders[broker.ID()][topic], partition)
+				e.sgPartitionLeadersMutex.Unlock()
 				ch <- prometheus.MustNewConstMetric(
 					topicPartitionLeader, prometheus.GaugeValue, float64(broker.ID()), topic, strconv.FormatInt(int64(partition), 10),
 				)
 			}
-
-            if err := broker.Open(e.client.Config()); err != nil && err != sarama.ErrAlreadyConnected {
-                glog.Errorf("Error open Kafka broker: %v", err)
-            }
-            describeLogDirs, err := broker.DescribeLogDirs(&sarama.DescribeLogDirsRequest{1, []sarama.DescribeLogDirsRequestTopic{{string(topic), []int32{int32(partition)}}}})
-            if err != nil {
-                glog.Errorf("Error describe log dirs: %v", err)
-            }
-            for _, logDir := range describeLogDirs.LogDirs {
-                for _, topic4size := range logDir.Topics {
-                    for _, partition4size := range topic4size.Partitions {
-                        ch <- prometheus.MustNewConstMetric(
-                            topicPartitionSize, prometheus.GaugeValue, float64(partition4size.Size), topic, strconv.FormatInt(int64(partition), 10),
-                        )
-                    }
-                }
-            }
 
 			currentOffset, err := e.client.GetOffset(topic, partition, sarama.OffsetNewest)
 			if err != nil {
@@ -590,7 +585,7 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 						glog.Errorf("Cannot get GetMemberAssignment of group member %v : %v", member, err)
 						return
 					}
-				for topic, partions := range assignment.Topics {
+					for topic, partions := range assignment.Topics {
 						for _, partition := range partions {
 							offsetFetchRequest.AddPartition(topic, partition)
 						}
@@ -660,6 +655,51 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 				)
 			}
 		}
+	}
+
+	getPartitionSizeMetrics := func(broker *sarama.Broker, brokerPartitions map[string][]int32, locPartitionSizes map[string]map[int32]int64) {
+		defer wg.Done()
+		if err := broker.Open(e.client.Config()); err != nil && err != sarama.ErrAlreadyConnected {
+			glog.Errorf("Cannot connect to broker %d: %v", broker.ID(), err)
+			return
+		}
+		defer broker.Close()
+
+		var partitionArr []sarama.DescribeLogDirsRequestTopic
+		for topic, partitions := range brokerPartitions {
+			partitionArr = append(partitionArr, sarama.DescribeLogDirsRequestTopic{Topic: topic, PartitionIDs: partitions})
+		}
+		describeLogDirs, err := broker.DescribeLogDirs(&sarama.DescribeLogDirsRequest{Version: 1, DescribeTopics: partitionArr})
+		if err != nil {
+			glog.Errorf("Error describe log dirs: %v", err)
+		}
+		e.sgPartitionsMutex.Lock()
+		for _, logDir := range describeLogDirs.LogDirs {
+			for _, topic4size := range logDir.Topics {
+				for _, partition4size := range topic4size.Partitions {
+					locPartitionSizes[topic4size.Topic][partition4size.PartitionID] = partition4size.Size
+				}
+			}
+		}
+		e.sgPartitionsMutex.Unlock()
+	}
+
+	glog.Info("Fetching partition size metrics")
+	if len(e.client.Brokers()) > 0 {
+		for _, broker := range e.client.Brokers() {
+			wg.Add(1)
+			go getPartitionSizeMetrics(broker, partitionLeaders[broker.ID()], partitionSizes)
+		}
+		wg.Wait()
+		for topic, partitions := range partitionSizes {
+			for partition, size := range partitions {
+				ch <- prometheus.MustNewConstMetric(
+					topicPartitionSize, prometheus.GaugeValue, float64(size), topic, strconv.FormatInt(int64(partition), 10),
+				)
+			}
+		}
+	} else {
+		glog.Errorln("No valid broker, cannot get partition size metrics")
 	}
 
 	glog.V(DEBUG).Info("Fetching consumer group metrics")
