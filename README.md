@@ -115,15 +115,12 @@ This image is configurable using different flags
 | server.tls.cert-file                |                | The certificate file for the web server                                                                                |
 | server.tls.key-file                 |                | The key file for the web server                                                                                        |
 | topic.filter                 | .*             | Regex that determines which topics to collect                                                                                          |
-| group.filter                 | .*             | Regex that determines which consumer groups to collect                                                                                 |
 | web.listen-address           | :9308          | Address to listen on for web interface and telemetry                                                                                   |
 | web.telemetry-path           | /metrics       | Path under which to expose metrics                                                                                                     |
 | log.enable-sarama            | false          | Turn on Sarama logging                                                                                                                 |
-| use.consumelag.zookeeper     | false          | if you need to use a group from zookeeper                                                                                              |
 | zookeeper.server             | localhost:2181 | Address (hosts) of zookeeper server                                                                                                    |
 | kafka.labels                 |                | Kafka cluster name                                                                                                                     |
 | refresh.metadata             | 30s            | Metadata refresh interval                                                                                                              |
-| offset.show-all              | true           | Whether show the offset/lag for all consumer group, otherwise, only show connected consumer groups                                     |
 | concurrent.enable            | false          | If true, all scrapes will trigger kafka operations otherwise, they will share results. WARN: This should be disabled on large clusters |
 | topic.workers                | 100            | Number of topic workers                                                                                                                |
 | verbosity                    | 0              | Verbosity log level                                                                                                                    |
@@ -212,27 +209,6 @@ kafka_topic_partition_replicas{partition="0",topic="__consumer_offsets"} 3
 kafka_topic_partition_under_replicated_partition{partition="0",topic="__consumer_offsets"} 0
 ```
 
-### Consumer Groups
-
-**Metrics details**
-
-| Name                                 | Exposed informations                                          |
-| ------------------------------------ | ------------------------------------------------------------- |
-| `kafka_consumergroup_current_offset` | Current Offset of a ConsumerGroup at Topic/Partition          |
-| `kafka_consumergroup_lag`            | Current Approximate Lag of a ConsumerGroup at Topic/Partition |
-
-**Metrics output example**
-
-```txt
-# HELP kafka_consumergroup_current_offset Current Offset of a ConsumerGroup at Topic/Partition
-# TYPE kafka_consumergroup_current_offset gauge
-kafka_consumergroup_current_offset{consumergroup="KMOffsetCache-kafka-manager-3806276532-ml44w",partition="0",topic="__consumer_offsets"} -1
-
-# HELP kafka_consumergroup_lag Current Approximate Lag of a ConsumerGroup at Topic/Partition
-# TYPE kafka_consumergroup_lag gauge
-kafka_consumergroup_lag{consumergroup="KMOffsetCache-kafka-manager-3806276532-ml44w",partition="0",topic="__consumer_offsets"} 1
-```
-
 Grafana Dashboard
 -------
 
@@ -252,16 +228,14 @@ Contributors ✨
 
 Thanks goes to these wonderful people:
 
-<a href="https://github.com/danielqsj/kafka_exporter/graphs/contributors">
-<img src="https://contrib.rocks/image?repo=danielqsj/kafka_exporter" />
+<a href="https://github.com/baowei/kafka_exporter/graphs/contributors">
+<img src="https://contrib.rocks/image?repo=baowei/kafka_exporter" />
 </a>
 
 Donation
 --------
 
-Your donation will encourage me to continue to improve Kafka Exporter. Support Alipay donation.
-
-![](https://github.com/danielqsj/kafka_exporter/raw/master/alipay.jpg)
+This repo forks from [danielqsj](https://github.com/danielqsj/kafka_exporter)'s awesome project, if you want to support him you can donate in source project.
 
 License
 -------

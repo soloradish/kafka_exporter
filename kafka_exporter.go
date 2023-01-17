@@ -50,12 +50,6 @@ var (
 	topicPartitionInSyncReplicas       *prometheus.Desc
 	topicPartitionUsesPreferredReplica *prometheus.Desc
 	topicUnderReplicatedPartition      *prometheus.Desc
-	consumergroupCurrentOffset         *prometheus.Desc
-	consumergroupCurrentOffsetSum      *prometheus.Desc
-	consumergroupLag                   *prometheus.Desc
-	consumergroupLagSum                *prometheus.Desc
-	consumergroupLagZookeeper          *prometheus.Desc
-	consumergroupMembers               *prometheus.Desc
 )
 
 // Exporter collects Kafka stats from the given server and exports them using
@@ -63,13 +57,11 @@ var (
 type Exporter struct {
 	client                  sarama.Client
 	topicFilter             *regexp.Regexp
-	groupFilter             *regexp.Regexp
 	mu                      sync.Mutex
 	useZooKeeperLag         bool
 	zookeeperClient         *kazoo.Kazoo
 	nextMetadataRefresh     time.Time
 	metadataRefreshInterval time.Duration
-	offsetShowAll           bool
 	topicWorkers            int
 	allowConcurrent         bool
 	sgMutex                 sync.Mutex
@@ -77,7 +69,6 @@ type Exporter struct {
 	sgPartitionLeadersMutex sync.Mutex
 	sgWaitCh                chan struct{}
 	sgChans                 []chan<- prometheus.Metric
-	consumerGroupFetchAll   bool
 }
 
 type kafkaOpts struct {
@@ -150,7 +141,7 @@ func canReadFile(path string) bool {
 }
 
 // NewExporter returns an initialized Exporter.
-func NewExporter(opts kafkaOpts, topicFilter string, groupFilter string) (*Exporter, error) {
+func NewExporter(opts kafkaOpts, topicFilter string) (*Exporter, error) {
 	var zookeeperClient *kazoo.Kazoo
 	config := sarama.NewConfig()
 	config.ClientID = clientID
@@ -263,18 +254,15 @@ func NewExporter(opts kafkaOpts, topicFilter string, groupFilter string) (*Expor
 	return &Exporter{
 		client:                  client,
 		topicFilter:             regexp.MustCompile(topicFilter),
-		groupFilter:             regexp.MustCompile(groupFilter),
 		useZooKeeperLag:         opts.useZooKeeperLag,
 		zookeeperClient:         zookeeperClient,
 		nextMetadataRefresh:     time.Now(),
 		metadataRefreshInterval: interval,
-		offsetShowAll:           opts.offsetShowAll,
 		topicWorkers:            opts.topicWorkers,
 		allowConcurrent:         opts.allowConcurrent,
 		sgMutex:                 sync.Mutex{},
 		sgWaitCh:                nil,
 		sgChans:                 []chan<- prometheus.Metric{},
-		consumerGroupFetchAll:   config.Version.IsAtLeast(sarama.V2_0_0_0),
 	}, nil
 }
 
@@ -303,11 +291,6 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- topicPartitionInSyncReplicas
 	ch <- topicPartitionUsesPreferredReplica
 	ch <- topicUnderReplicatedPartition
-	ch <- consumergroupCurrentOffset
-	ch <- consumergroupCurrentOffsetSum
-	ch <- consumergroupLag
-	ch <- consumergroupLagZookeeper
-	ch <- consumergroupLagSum
 }
 
 // Collect fetches the stats from configured Kafka location and delivers them
@@ -485,25 +468,6 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 					topicUnderReplicatedPartition, prometheus.GaugeValue, float64(0), topic, strconv.FormatInt(int64(partition), 10),
 				)
 			}
-
-			if e.useZooKeeperLag {
-				ConsumerGroups, err := e.zookeeperClient.Consumergroups()
-
-				if err != nil {
-					glog.Errorf("Cannot get consumer group %v", err)
-				}
-
-				for _, group := range ConsumerGroups {
-					offset, _ := group.FetchOffset(topic, partition)
-					if offset > 0 {
-
-						consumerGroupLag := currentOffset - offset
-						ch <- prometheus.MustNewConstMetric(
-							consumergroupLagZookeeper, prometheus.GaugeValue, float64(consumerGroupLag), group.Name, topic, strconv.FormatInt(int64(partition), 10),
-						)
-					}
-				}
-			}
 		}
 	}
 
@@ -544,118 +508,6 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 	close(topicChannel)
 
 	wg.Wait()
-
-	getConsumerGroupMetrics := func(broker *sarama.Broker) {
-		defer wg.Done()
-		if err := broker.Open(e.client.Config()); err != nil && err != sarama.ErrAlreadyConnected {
-			glog.Errorf("Cannot connect to broker %d: %v", broker.ID(), err)
-			return
-		}
-		defer broker.Close()
-
-		groups, err := broker.ListGroups(&sarama.ListGroupsRequest{})
-		if err != nil {
-			glog.Errorf("Cannot get consumer group: %v", err)
-			return
-		}
-		groupIds := make([]string, 0)
-		for groupId := range groups.Groups {
-			if e.groupFilter.MatchString(groupId) {
-				groupIds = append(groupIds, groupId)
-			}
-		}
-
-		describeGroups, err := broker.DescribeGroups(&sarama.DescribeGroupsRequest{Groups: groupIds})
-		if err != nil {
-			glog.Errorf("Cannot get describe groups: %v", err)
-			return
-		}
-		for _, group := range describeGroups.Groups {
-			offsetFetchRequest := sarama.OffsetFetchRequest{ConsumerGroup: group.GroupId, Version: 1}
-			if e.offsetShowAll {
-				for topic, partitions := range offset {
-					for partition := range partitions {
-						offsetFetchRequest.AddPartition(topic, partition)
-					}
-				}
-			} else {
-				for _, member := range group.Members {
-					assignment, err := member.GetMemberAssignment()
-					if err != nil {
-						glog.Errorf("Cannot get GetMemberAssignment of group member %v : %v", member, err)
-						return
-					}
-					for topic, partions := range assignment.Topics {
-						for _, partition := range partions {
-							offsetFetchRequest.AddPartition(topic, partition)
-						}
-					}
-				}
-			}
-			ch <- prometheus.MustNewConstMetric(
-				consumergroupMembers, prometheus.GaugeValue, float64(len(group.Members)), group.GroupId,
-			)
-			offsetFetchResponse, err := broker.FetchOffset(&offsetFetchRequest)
-			if err != nil {
-				glog.Errorf("Cannot get offset of group %s: %v", group.GroupId, err)
-				continue
-			}
-
-			for topic, partitions := range offsetFetchResponse.Blocks {
-				// If the topic is not consumed by that consumer group, skip it
-				topicConsumed := false
-				for _, offsetFetchResponseBlock := range partitions {
-					// Kafka will return -1 if there is no offset associated with a topic-partition under that consumer group
-					if offsetFetchResponseBlock.Offset != -1 {
-						topicConsumed = true
-						break
-					}
-				}
-				if !topicConsumed {
-					continue
-				}
-
-				var currentOffsetSum int64
-				var lagSum int64
-				for partition, offsetFetchResponseBlock := range partitions {
-					err := offsetFetchResponseBlock.Err
-					if err != sarama.ErrNoError {
-						glog.Errorf("Error for  partition %d :%v", partition, err.Error())
-						continue
-					}
-					currentOffset := offsetFetchResponseBlock.Offset
-					currentOffsetSum += currentOffset
-					ch <- prometheus.MustNewConstMetric(
-						consumergroupCurrentOffset, prometheus.GaugeValue, float64(currentOffset), group.GroupId, topic, strconv.FormatInt(int64(partition), 10),
-					)
-					e.mu.Lock()
-					if offset, ok := offset[topic][partition]; ok {
-						// If the topic is consumed by that consumer group, but no offset associated with the partition
-						// forcing lag to -1 to be able to alert on that
-						var lag int64
-						if offsetFetchResponseBlock.Offset == -1 {
-							lag = -1
-						} else {
-							lag = offset - offsetFetchResponseBlock.Offset
-							lagSum += lag
-						}
-						ch <- prometheus.MustNewConstMetric(
-							consumergroupLag, prometheus.GaugeValue, float64(lag), group.GroupId, topic, strconv.FormatInt(int64(partition), 10),
-						)
-					} else {
-						glog.Errorf("No offset of topic %s partition %d, cannot get consumer group lag", topic, partition)
-					}
-					e.mu.Unlock()
-				}
-				ch <- prometheus.MustNewConstMetric(
-					consumergroupCurrentOffsetSum, prometheus.GaugeValue, float64(currentOffsetSum), group.GroupId, topic,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					consumergroupLagSum, prometheus.GaugeValue, float64(lagSum), group.GroupId, topic,
-				)
-			}
-		}
-	}
 
 	getPartitionSizeMetrics := func(broker *sarama.Broker, brokerPartitions map[string][]int32, locPartitionSizes map[string]map[int32]int64) {
 		defer wg.Done()
@@ -700,17 +552,6 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 		}
 	} else {
 		glog.Errorln("No valid broker, cannot get partition size metrics")
-	}
-
-	glog.V(DEBUG).Info("Fetching consumer group metrics")
-	if len(e.client.Brokers()) > 0 {
-		for _, broker := range e.client.Brokers() {
-			wg.Add(1)
-			go getConsumerGroupMetrics(broker)
-		}
-		wg.Wait()
-	} else {
-		glog.Errorln("No valid broker, cannot get consumer group metrics")
 	}
 }
 
@@ -759,7 +600,6 @@ func main() {
 		listenAddress = toFlagString("web.listen-address", "Address to listen on for web interface and telemetry.", ":9308")
 		metricsPath   = toFlagString("web.telemetry-path", "Path under which to expose metrics.", "/metrics")
 		topicFilter   = toFlagString("topic.filter", "Regex that determines which topics to collect.", ".*")
-		groupFilter   = toFlagString("group.filter", "Regex that determines which consumer groups to collect.", ".*")
 		logSarama     = toFlagBool("log.enable-sarama", "Turn on Sarama logging.", false, "false")
 
 		opts = kafkaOpts{}
@@ -789,11 +629,9 @@ func main() {
 	toFlagStringVar("server.tls.key-file", "The key file for the web server.", "", &opts.serverTlsKeyFile)
 	toFlagBoolVar("tls.insecure-skip-tls-verify", "If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure.", false, "false", &opts.tlsInsecureSkipTLSVerify)
 	toFlagStringVar("kafka.version", "Kafka broker version", sarama.V2_0_0_0.String(), &opts.kafkaVersion)
-	toFlagBoolVar("use.consumelag.zookeeper", "if you need to use a group from zookeeper", false, "false", &opts.useZooKeeperLag)
 	toFlagStringsVar("zookeeper.server", "Address (hosts) of zookeeper server.", "localhost:2181", &opts.uriZookeeper)
 	toFlagStringVar("kafka.labels", "Kafka cluster name", "", &opts.labels)
 	toFlagStringVar("refresh.metadata", "Metadata refresh interval", "30s", &opts.metadataRefreshInterval)
-	toFlagBoolVar("offset.show-all", "Whether show the offset/lag for all consumer group, otherwise, only show connected consumer groups", true, "true", &opts.offsetShowAll)
 	toFlagBoolVar("concurrent.enable", "If true, all scrapes will trigger kafka operations otherwise, they will share results. WARN: This should be disabled on large clusters", false, "false", &opts.allowConcurrent)
 	toFlagIntVar("topic.workers", "Number of topic workers", 100, "100", &opts.topicWorkers)
 	toFlagIntVar("verbosity", "Verbosity log level", 0, "0", &opts.verbosityLogLevel)
@@ -816,14 +654,13 @@ func main() {
 		}
 	}
 
-	setup(*listenAddress, *metricsPath, *topicFilter, *groupFilter, *logSarama, opts, labels)
+	setup(*listenAddress, *metricsPath, *topicFilter, *logSarama, opts, labels)
 }
 
 func setup(
 	listenAddress string,
 	metricsPath string,
 	topicFilter string,
-	groupFilter string,
 	logSarama bool,
 	opts kafkaOpts,
 	labels map[string]string,
@@ -895,47 +732,11 @@ func setup(
 		[]string{"topic", "partition"}, labels,
 	)
 
-	consumergroupCurrentOffset = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "consumergroup", "current_offset"),
-		"Current Offset of a ConsumerGroup at Topic/Partition",
-		[]string{"consumergroup", "topic", "partition"}, labels,
-	)
-
-	consumergroupCurrentOffsetSum = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "consumergroup", "current_offset_sum"),
-		"Current Offset of a ConsumerGroup at Topic for all partitions",
-		[]string{"consumergroup", "topic"}, labels,
-	)
-
-	consumergroupLag = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "consumergroup", "lag"),
-		"Current Approximate Lag of a ConsumerGroup at Topic/Partition",
-		[]string{"consumergroup", "topic", "partition"}, labels,
-	)
-
-	consumergroupLagZookeeper = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "consumergroupzookeeper", "lag_zookeeper"),
-		"Current Approximate Lag(zookeeper) of a ConsumerGroup at Topic/Partition",
-		[]string{"consumergroup", "topic", "partition"}, nil,
-	)
-
-	consumergroupLagSum = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "consumergroup", "lag_sum"),
-		"Current Approximate Lag of a ConsumerGroup at Topic for all partitions",
-		[]string{"consumergroup", "topic"}, labels,
-	)
-
-	consumergroupMembers = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "consumergroup", "members"),
-		"Amount of members in a consumer group",
-		[]string{"consumergroup"}, labels,
-	)
-
 	if logSarama {
 		sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
 	}
 
-	exporter, err := NewExporter(opts, topicFilter, groupFilter)
+	exporter, err := NewExporter(opts, topicFilter)
 	if err != nil {
 		glog.Fatalln(err)
 	}
