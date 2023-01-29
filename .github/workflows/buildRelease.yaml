@@ -18,8 +18,12 @@ jobs:
         run: |
           make crossbuild
           tree .build
+        env:
+          GOPATH: /home/runner/go
 
       - name: release
         if: ${{ github.ref == 'refs/heads/master' }}
         run: |
           make release
+        env:
+          GOPATH: /home/runner/go
