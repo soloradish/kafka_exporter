@@ -1,5 +1,5 @@
 repository:
-    path: github.com/baowei/kafka_exporter
+    path: github.com/soloradish/kafka_exporter
 build:
     flags: -a -tags netgo
     ldflags: |
