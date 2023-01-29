@@ -27,3 +27,4 @@ jobs:
           make release
         env:
           GOPATH: /home/runner/go
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
