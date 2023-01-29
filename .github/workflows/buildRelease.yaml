@@ -1,0 +1,30 @@
+name: Go package
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.17
+          cache: true
+
+      - name: build
+        run: |
+          make crossbuild
+          tree .build
+        env:
+          GOPATH: /home/runner/go
+
+      - name: release
+        if: ${{ github.ref == 'refs/heads/master' }}
+        run: |
+          make release
+        env:
+          GOPATH: /home/runner/go
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
