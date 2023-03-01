@@ -69,6 +69,8 @@ type Exporter struct {
 	sgPartitionLeadersMutex sync.Mutex
 	sgWaitCh                chan struct{}
 	sgChans                 []chan<- prometheus.Metric
+	uri                     []string
+	config                  *sarama.Config
 }
 
 type kafkaOpts struct {
@@ -263,6 +265,8 @@ func NewExporter(opts kafkaOpts, topicFilter string) (*Exporter, error) {
 		sgMutex:                 sync.Mutex{},
 		sgWaitCh:                nil,
 		sgChans:                 []chan<- prometheus.Metric{},
+		uri:                     opts.uri,
+		config:                  config,
 	}, nil
 }
 
@@ -345,9 +349,32 @@ func (e *Exporter) collectChans(quit chan struct{}) {
 
 func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 	var wg = sync.WaitGroup{}
-	ch <- prometheus.MustNewConstMetric(
-		clusterBrokers, prometheus.GaugeValue, float64(len(e.client.Brokers())),
-	)
+	brokerStatus := make(map[string]int)
+	for _, s := range e.uri {
+		newBroker := sarama.NewBroker(s)
+		err := newBroker.Open(e.config)
+		if err != nil {
+			panic(err)
+		}
+		request := &sarama.HeartbeatRequest{
+			GroupId:      "kafka_exporter",
+			MemberId:     "kafka_exporter",
+			GenerationId: 1,
+		}
+		_, err = newBroker.Heartbeat(request)
+		if err != nil {
+			glog.V(INFO).Infoln("Failed to send heartbeat request:", err)
+			brokerStatus[s] = 0
+		} else {
+			brokerStatus[s] = 1
+		}
+	}
+
+	for addr, status := range brokerStatus {
+		ch <- prometheus.MustNewConstMetric(
+			clusterBrokers, prometheus.GaugeValue, float64(status), addr,
+		)
+	}
 
 	offset := make(map[string]map[int32]int64)
 	partitionLeaders := make(map[int32]map[string][]int32, len(e.client.Brokers()))
@@ -403,6 +430,12 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 				glog.Errorf("Cannot get leader of topic %s partition %d: %v", topic, partition, err)
 			} else {
 				e.sgPartitionLeadersMutex.Lock()
+				if partitionLeaders[broker.ID()] == nil {
+					partitionLeaders[broker.ID()] = make(map[string][]int32)
+				}
+				if _, ok := partitionLeaders[broker.ID()][topic]; !ok {
+					partitionLeaders[broker.ID()][topic] = make([]int32, 0)
+				}
 				partitionLeaders[broker.ID()][topic] = append(partitionLeaders[broker.ID()][topic], partition)
 				e.sgPartitionLeadersMutex.Unlock()
 				ch <- prometheus.MustNewConstMetric(
@@ -676,9 +709,9 @@ func setup(
 	glog.V(DEBUG).Infoln("Build context", version.BuildContext())
 
 	clusterBrokers = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "", "brokers"),
+		prometheus.BuildFQName(namespace, "", "brokers_up"),
 		"Number of Brokers in the Kafka Cluster.",
-		nil, labels,
+		[]string{"broker"}, labels,
 	)
 	topicPartitions = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "topic", "partitions"),
